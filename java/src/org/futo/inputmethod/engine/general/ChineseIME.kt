@@ -26,6 +26,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
@@ -614,10 +615,15 @@ class ChineseIME(val helper: IMEHelper) : IMEInterface, SuggestionStripViewAcces
     }
 
     private var configSemaphore = Semaphore(1)
+    private var configUpdatePending = false
     private fun updateConfig() {
         coroScope.launch {
             if(editingState.active) return@launch
-            if(!configSemaphore.tryAcquire()) return@launch
+            if(!configSemaphore.tryAcquire()) {
+                // e.g. the layout changed while loading, apply it once the current update is done
+                configUpdatePending = true
+                return@launch
+            }
 
             try {
                 val settings = Settings.getInstance().current
@@ -673,26 +679,34 @@ class ChineseIME(val helper: IMEHelper) : IMEInterface, SuggestionStripViewAcces
                     writeCustomizationFile(config)
                     rime.deploy()
 
-                    var result = false
-                    for(i in 0..10) {
-                        if(rime.selectSchema(config.schema)) {
-                            result = true
-                            break
-                        }
-                        Thread.sleep(300L)
+                    // deploy() returns while RIME is still building in the background, during
+                    // which it rejects all input. The first build can take a while on a phone,
+                    // so keep waiting with the loading indicator shown
+                    val deadline = SystemClock.uptimeMillis() + 60_000L
+                    var result = rime.selectSchema(config.schema)
+                    while(!result && SystemClock.uptimeMillis() < deadline) {
+                        delay(300L)
+                        result = rime.selectSchema(config.schema)
                     }
 
                     if(!result) {
-                        Log.e(TAG, "Failed to select schema 3s after deployment!")
+                        Log.e(TAG, "Failed to select schema 60s after deployment!")
                     }
 
                     rime.setOption("simplification", simplified)
                     rime.setOption("traditional", !simplified)
-                    prevConfiguration = config
+
+                    // Only remember the configuration once applied, so that a failure is retried
+                    if(result) prevConfiguration = config
                 }
             } finally {
                 configSemaphore.release()
                 rimeLoading.value = false
+
+                if(configUpdatePending) {
+                    configUpdatePending = false
+                    updateConfig()
+                }
             }
         }
     }
